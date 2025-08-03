@@ -18,7 +18,9 @@ type Fs struct {
 }
 
 type cephArgs struct {
-	Name string
+	Name        string
+	KeyringPath string
+	ConfigPath  string
 }
 
 func getCephArgs() cephArgs {
@@ -31,6 +33,8 @@ func getCephArgs() cephArgs {
 	prefixes := map[string]*string{
 		"-n=":     &myArgs.Name,
 		"--name=": &myArgs.Name,
+		"-c=":     &myArgs.ConfigPath,
+		"-k=":     &myArgs.KeyringPath,
 	}
 
 	for _, arg := range args {
@@ -56,8 +60,14 @@ func NewCephFS() (*Fs, error) {
 		return nil, fmt.Errorf("failed to create cephfs mount with id %s: %w", mountId, err)
 	}
 
-	if err := mount.ReadDefaultConfigFile(); err != nil {
-		return nil, fmt.Errorf("failed to read default ceph config: %w", err)
+	if args.ConfigPath != "" {
+		if err := mount.ReadConfigFile(args.ConfigPath); err != nil {
+			return nil, fmt.Errorf("failed to read ceph config at %s: %w", args.ConfigPath, err)
+		}
+	} else {
+		if err := mount.ReadDefaultConfigFile(); err != nil {
+			return nil, fmt.Errorf("failed to read default ceph config: %w", err)
+		}
 	}
 
 	if err := mount.Mount(); err != nil {
