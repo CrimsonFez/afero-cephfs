@@ -3,6 +3,7 @@ package cephfs
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -113,7 +114,7 @@ func (fs *Fs) Create(path string) (afero.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &File{cfile, fs.mount, path}, nil
+	return &File{fs.mount, path, cfile, nil}, nil
 }
 
 // Mkdir creates a directory in the filesystem, return an error if any
@@ -134,25 +135,30 @@ func (fs *Fs) MkdirAll(path string, perm os.FileMode) error {
 
 // Open opens a file, returning it or an error, if any happens.
 func (fs *Fs) Open(path string) (afero.File, error) {
-	cfile, err := fs.mount.Open(path, os.O_RDONLY, 0)
-	if err != nil {
-		/* return nil, fmt.Errorf("failed to open filepath %s: %w", path, err) */
-		return nil, convertErr(err)
-	}
-	return &File{cfile, fs.mount, path}, nil
+	return fs.OpenFile(path, os.O_RDONLY, 0)
 }
 
 // OpenFile opens a file using the given flags and the given mode.
 func (fs *Fs) OpenFile(path string, flag int, perm os.FileMode) (afero.File, error) {
 	cfile, err := fs.mount.Open(path, flag, uint32(perm.Perm()))
 	if err != nil {
-		// i'm unsure whether we need to convert some of the errors
-		/* if errors.Is(err, cephfs.ErrNotExist) {
-			return nil, os.ErrNotExist
-		} */
+		return nil, convertErr(err)
+	}
+
+	info, err := cfile.Fstatx(gocephfs.StatxBasicStats, 0)
+	if err != nil {
 		return nil, err
 	}
-	return &File{cfile, fs.mount, path}, nil
+
+	if toFileMode(info.Mode).IsDir() {
+		dir, err := fs.mount.OpenDir(path)
+		if err != nil {
+			return nil, convertErr(err)
+		}
+		return &File{fs.mount, path, cfile, dir}, nil
+	}
+
+	return &File{fs.mount, path, cfile, nil}, nil
 }
 
 // Remove removes a file identified by name, returning an error, if any
@@ -285,48 +291,153 @@ func (fs *Fs) Chtimes(path string, atime time.Time, mtime time.Time) error {
 // file implementation
 
 type File struct {
-	*gocephfs.File
 	mount *gocephfs.MountInfo
 	path  string
+	file  *gocephfs.File
+	dir   *gocephfs.Directory
 }
 
 func (f *File) Name() string {
 	return f.path
 }
 
-// create list of items from a dir. use a callback function to mutate the item before adding it to the list
-func listFromDir[T any](file *File, count int, callback func(*gocephfs.DirEntry) (T, error)) ([]T, error) {
-	stat, err := file.Stat()
+func (f *File) Close() error {
+	var errs []error
+	if f.file != nil {
+		if err := f.file.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if f.dir != nil {
+		if err := f.dir.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 1 {
+		return fmt.Errorf("failed to close file for reasons; %w; %w", errs[0], errs[1])
+	}
+	if len(errs) == 1 {
+		return errs[0]
+	}
+	return nil
+}
+
+var (
+	ErrDirDoesntSupport = errors.New("type of Dir does not support this operation")
+	ErrFileNil          = errors.New("cephfs file is nil, is this a directory?")
+	ErrDirNil           = errors.New("cephfs dir is nil, is this a file?")
+)
+
+func (f *File) Read(buf []byte) (int, error) {
+	if f.file == nil {
+		return 0, ErrFileNil
+	}
+	return f.file.Read(buf)
+}
+
+func (f *File) ReadAt(buf []byte, offset int64) (int, error) {
+	if f.file == nil {
+		return 0, ErrFileNil
+	}
+	return f.file.ReadAt(buf, offset)
+}
+
+func (f *File) Write(buf []byte) (int, error) {
+	if f.file == nil {
+		return 0, ErrFileNil
+	}
+	return f.file.Write(buf)
+}
+
+func (f *File) WriteAt(buf []byte, off int64) (int, error) {
+	if f.file == nil {
+		return 0, ErrFileNil
+	}
+	return f.file.WriteAt(buf, off)
+}
+
+func (f *File) Seek(offset int64, whence int) (int64, error) {
+	if f.file == nil {
+		return 0, ErrFileNil
+	}
+	return f.file.Seek(offset, whence)
+}
+
+func (f *File) Stat() (os.FileInfo, error) {
+	if f.file == nil {
+		return nil, ErrFileNil
+	}
+	stat, err := f.file.Fstatx(gocephfs.StatxBasicStats, 0)
 	if err != nil {
 		return nil, err
 	}
+	return &FileInfo{stat: stat, path: f.path}, nil
+}
 
-	if stat.IsDir() {
-		dir, err := file.mount.OpenDir(file.path)
-		if err != nil {
-			return nil, fmt.Errorf("failed %w", err)
-		}
-		defer dir.Close()
+func (f *File) Sync() error {
+	if f.file == nil {
+		return ErrFileNil
+	}
+	return f.file.Sync()
+}
 
+func (f *File) Truncate(size int64) error {
+	if f.file == nil {
+		return ErrFileNil
+	}
+	return f.file.Truncate(size)
+}
+
+func (f *File) WriteString(s string) (int, error) {
+	if f.file == nil {
+		return 0, ErrFileNil
+	}
+	return f.Write([]byte(s))
+}
+
+/*
+os.File.Readdir spec:
+Readdir reads the contents of the directory associated with file and returns a slice of up to n FileInfo values, as would be returned by Lstat, in directory order. Subsequent calls on the same file will yield further FileInfos.
+
+If n > 0, Readdir returns at most n FileInfo structures. In this case, if Readdir returns an empty slice, it will return a non-nil error explaining why. At the end of a directory, the error is io.EOF.
+
+If n <= 0, Readdir returns all the FileInfo from the directory in a single slice. In this case, if Readdir succeeds (reads all the way to the end of the directory), it returns the slice and a nil error. If it encounters an error before the end of the directory, Readdir returns the FileInfo read until that point and a non-nil error.
+
+note:
+cephfs does not have any restriction on reproducible ordering of directories. if we run into issues with this in the future we'll have to redo this function. That would likely involve having our own read itterator and instead of reading one file at a time, we read them all (-1) and sort them before culling the list to the requested ammount and returning
+*/
+func (f *File) Readdir(count int) ([]os.FileInfo, error) {
+	if f.dir == nil {
+		return nil, ErrDirNil
+	}
+
+	if count == 0 {
+		count = -1
+	}
+
+	list := make([]os.FileInfo, 0)
+
+	for {
 		if count == 0 {
-			count = -1
+			return list, nil
+		}
+		de, err := f.dir.ReadDirPlus(gocephfs.StatxBasicStats, 0)
+		if err != nil {
+			return list, fmt.Errorf("cephfs: failed to list file: %w", err)
+		}
+		// de is nil at end of list
+		if de == nil {
+			// if we reached end of list before reaching zero, err is io.EOF
+			if count > 0 {
+				return list, io.EOF
+			}
+			return list, nil
 		}
 
-		list := make([]T, 0)
-
-		for count != 0 {
-			de, err := dir.ReadDir()
-			if err != nil {
-				return list, fmt.Errorf("failed cephfs.ReadDir: %w", err)
-			}
-			if de == nil {
-				return list, nil
-			}
-
-			item, err := callback(de)
-			if err != nil {
-				return list, fmt.Errorf("listFromDir callback failed: %w", err)
-			}
+		// dont list the current dir and parent dir
+		if name := de.Name(); name != "." && name != ".." {
+			fullPath := f.path + "/" + de.Name()
+			item := &FileInfo{stat: de.Statx(), path: fullPath}
 
 			list = append(list, item)
 
@@ -334,44 +445,17 @@ func listFromDir[T any](file *File, count int, callback func(*gocephfs.DirEntry)
 				count--
 			}
 		}
-
-		return list, nil
-
-	} else {
-		return nil, errors.New("not a directory")
 	}
-}
-
-// list items in directory
-func (f *File) Readdir(count int) ([]os.FileInfo, error) {
-	return listFromDir(f, count, func(de *gocephfs.DirEntry) (os.FileInfo, error) {
-		fullPath := f.path + "/" + de.Name()
-		stat, err := f.mount.Statx(fullPath, gocephfs.StatxBasicStats, 0)
-		if err != nil {
-			return nil, fmt.Errorf("failed to statx file %v: %w", fullPath, err)
-		}
-
-		return &FileInfo{stat: stat, path: fullPath}, nil
-	})
 }
 
 // list items in directory only by name
-func (f *File) Readdirnames(n int) ([]string, error) {
-	return listFromDir(f, n, func(de *gocephfs.DirEntry) (string, error) {
-		return de.Name(), nil
-	})
-}
-
-func (f *File) Stat() (os.FileInfo, error) {
-	stat, err := f.Fstatx(gocephfs.StatxBasicStats, 0)
-	if err != nil {
-		return nil, err
+func (f *File) Readdirnames(count int) ([]string, error) {
+	deList, err := f.Readdir(count)
+	list := make([]string, 0)
+	for _, item := range deList {
+		list = append(list, item.Name())
 	}
-	return &FileInfo{stat: stat, path: f.path}, nil
-}
-
-func (f *File) WriteString(s string) (int, error) {
-	return f.Write([]byte(s))
+	return list, err
 }
 
 // implements os.FileInfo interface for CephFS.
